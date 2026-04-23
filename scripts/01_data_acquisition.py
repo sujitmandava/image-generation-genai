@@ -11,7 +11,6 @@ import os
 import sys
 from collections import Counter
 from pathlib import Path
-from utils import DATA_RAW, DEFAULT_STYLES, OUTPUTS_DIR, set_seed
 import matplotlib.pyplot as plt
 import pandas as pd
 from datasets import load_dataset
@@ -22,6 +21,8 @@ from tqdm import tqdm
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from utils import DATA_RAW, DEFAULT_STYLES, OUTPUTS_DIR, set_seed
 
 # Load variables from .env at the project root (HF_TOKEN, etc.).
 load_dotenv(PROJECT_ROOT / ".env")

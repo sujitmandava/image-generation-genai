@@ -8,4 +8,6 @@
 #SBATCH --mem=2G              ## How much RAM do you need per computer/node? G = gigabytes
 #SBATCH --job-name=test_quest_run       ## Used to identify the job 
 
-python scripts/01_data_acquisition.py 
+module load mamba/24.3.0
+python --version
+python scripts/01_data_acquisition.py --fraction 0.10 --n-styles 8 --max-side-px 512 --force False --seed 42
