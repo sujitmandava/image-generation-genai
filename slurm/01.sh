@@ -8,6 +8,20 @@
 #SBATCH --mem=2G              ## How much RAM do you need per computer/node? G = gigabytes
 #SBATCH --job-name=test_quest_run       ## Used to identify the job 
 
+set -euo pipefail
+
 module load mamba/24.3.0
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${PROJECT_ROOT}"
+
+VENV_PATH="${HOME}/.venvs/image-generation-genai"
+python -m venv "${VENV_PATH}"
+source "${VENV_PATH}/bin/activate"
+
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+
 python --version
-python ../scripts/01_data_acquisition.py --fraction 0.10 --n-styles 8 --max-side-px 512 --force False --seed 42
+python "${PROJECT_ROOT}/scripts/01_data_acquisition.py" --fraction 0.10 --n-styles 8 --max-side-px 512 --force False --seed 42
