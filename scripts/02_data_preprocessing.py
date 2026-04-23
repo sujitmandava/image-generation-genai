@@ -4,7 +4,6 @@ Reads `data/raw/` (produced by step 1), resizes + center-crops every image
 to IMAGE_SIZE using multiple worker processes, writes the result to
 `data/processed/`, and produces stratified train/val/test CSVs.
 """
-
 from __future__ import annotations
 
 import argparse
