@@ -25,3 +25,4 @@ python -m pip install -r requirements.txt
 
 python --version
 python "${PROJECT_ROOT}/scripts/01_data_acquisition.py" --fraction 0.10 --n-styles 8 --max-side-px 512 --force False --seed 42
+python "${PROJECT_ROOT}/scripts/02_data_preprocessing.py" --image-size 128 --val-frac 0.10 --test-frac 0.10 --workers 4
