@@ -21,7 +21,7 @@ python -m venv "${VENV_PATH}"
 source "${VENV_PATH}/bin/activate"
 
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m pip install -r "${PROJECT_ROOT}/requirements.txt"
 
 python --version
 python "${PROJECT_ROOT}/scripts/02_data_preprocessing.py" \
