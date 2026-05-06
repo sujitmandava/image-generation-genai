@@ -1,7 +1,7 @@
 """Step 1 - Data acquisition.
 
-Downloads a subset of `huggan/wikiart` to `data/raw/<style>/*.jpg` and writes
-`data/raw/index.csv`. Configure the run by editing the constants below.
+Downloads `huggan/wikiart` to `data/raw/<style>/*.jpg` and writes
+`data/raw/index.csv`. By default this script downloads the entire dataset.
 """
 
 from __future__ import annotations
@@ -32,26 +32,22 @@ if HF_TOKEN is None:
           "dataset access will be anonymous.")
 
 # ---------------------------------------------------------------------------
-# Configuration - edit these to change how much data is downloaded.
+# Configuration.
 # ---------------------------------------------------------------------------
 
-FRACTION              = 0.10       # Fraction of FULL_SUBSET_PER_STYLE to keep.
-N_STYLES              = 8          # Number of styles from utils.DEFAULT_STYLES.
+DOWNLOAD_ALL_STYLES   = True       # True -> use every style in the dataset.
+N_STYLES              = 8          # Used only when DOWNLOAD_ALL_STYLES is False.
 MAX_SIDE_PX           = 512        # Resize so max(w, h) <= MAX_SIDE_PX.
 FORCE                 = False      # Re-download even if index.csv already exists.
 SEED                  = 42
-FULL_SUBSET_PER_STYLE = 1250       # Target images per style at FRACTION == 1.0.
 
 set_seed(SEED)
 
-STYLES = list(DEFAULT_STYLES[:N_STYLES])
-PER_STYLE = max(50, int(round(FULL_SUBSET_PER_STYLE * FRACTION)))
-STYLE_TO_LABEL = {s: i for i, s in enumerate(STYLES)}
+if DOWNLOAD_ALL_STYLES:
+    STYLES = None
+else:
+    STYLES = list(DEFAULT_STYLES[:N_STYLES])
 
-print(f"Fraction:          {FRACTION:.2%}")
-print(f"Images per style:  {PER_STYLE}")
-print(f"Total target:      {PER_STYLE * N_STYLES}")
-print(f"Styles:            {STYLES}")
 print(f"Destination:       {DATA_RAW}")
 
 # Download images from Hugging Face.
@@ -61,14 +57,21 @@ ds = load_dataset("huggan/wikiart", split="train", streaming=True, token=HF_TOKE
 lbl_feat = ds.features.get("style")
 id_to_name = ({i: lbl_feat.int2str(i).replace(" ", "_") for i in range(lbl_feat.num_classes)} if lbl_feat is not None else None)
 
+if STYLES is None:
+    if id_to_name is None:
+        raise RuntimeError("Could not infer style names from dataset features.")
+    STYLES = [id_to_name[i] for i in sorted(id_to_name.keys())]
+
+STYLE_TO_LABEL = {s: i for i, s in enumerate(STYLES)}
+print(f"Downloading all samples for {len(STYLES)} styles.")
+print(f"Styles:            {STYLES}")
+
 counts: Counter[str] = Counter()
 rows: list[dict] = []
-pbar = tqdm(total=PER_STYLE * len(STYLES), desc="Collecting")
+pbar = tqdm(desc="Collecting", unit="img")
 for ex in ds:
     name = id_to_name[ex["style"]] if id_to_name is not None else (ex.get("style") or ex.get("genre"))
-    if name not in STYLE_TO_LABEL or counts[name] >= PER_STYLE:
-        if all(counts[s] >= PER_STYLE for s in STYLES):
-            break
+    if name not in STYLE_TO_LABEL:
         continue
     img = ex["image"]
     if not isinstance(img, Image.Image):
@@ -124,8 +127,7 @@ plt.close(fig)
 
 # Write manifest.
 manifest = {
-    "data_fraction": FRACTION,
-    "images_per_style": PER_STYLE,
+    "download_mode": "full_dataset",
     "n_images": int(len(df)),
     "styles": STYLES,
     "label_to_style": {i: s for i, s in enumerate(STYLES)},
