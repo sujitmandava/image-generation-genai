@@ -35,11 +35,11 @@ if HF_TOKEN is None:
 # Configuration.
 # ---------------------------------------------------------------------------
 
-DOWNLOAD_ALL_STYLES   = True       # True -> use every style in the dataset.
-N_STYLES              = 8          # Used only when DOWNLOAD_ALL_STYLES is False.
-MAX_SIDE_PX           = 512        # Resize so max(w, h) <= MAX_SIDE_PX.
-FORCE                 = False      # Re-download even if index.csv already exists.
-SEED                  = 42
+DOWNLOAD_ALL_STYLES = False       # True -> use every style in the dataset.
+N_STYLES = 10          # Used only when DOWNLOAD_ALL_STYLES is False.
+MAX_SIDE_PX = 512        # Resize so max(w, h) <= MAX_SIDE_PX.
+FORCE = False      # Re-download even if index.csv already exists.
+SEED = 42
 
 set_seed(SEED)
 
@@ -48,7 +48,7 @@ if DOWNLOAD_ALL_STYLES:
 else:
     STYLES = list(DEFAULT_STYLES[:N_STYLES])
 
-print(f"Destination:       {DATA_RAW}")
+print(f"Destination: {DATA_RAW}")
 
 # Download images from Hugging Face.
 index_csv = DATA_RAW / "index.csv"
@@ -64,7 +64,7 @@ if STYLES is None:
 
 STYLE_TO_LABEL = {s: i for i, s in enumerate(STYLES)}
 print(f"Downloading all samples for {len(STYLES)} styles.")
-print(f"Styles:            {STYLES}")
+print(f"Styles: {STYLES}")
 
 counts: Counter[str] = Counter()
 rows: list[dict] = []
