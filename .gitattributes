@@ -1,0 +1,11 @@
+# Git LFS configuration.
+# All PyTorch checkpoints (and other large model artifacts) are stored
+# via Git LFS so that the working repo stays small. To clone with the
+# real binaries, run `git lfs install` once on your machine, then a
+# normal `git clone` will fetch the LFS objects automatically.
+
+*.pt   filter=lfs diff=lfs merge=lfs -text
+*.pth  filter=lfs diff=lfs merge=lfs -text
+*.ckpt filter=lfs diff=lfs merge=lfs -text
+*.bin  filter=lfs diff=lfs merge=lfs -text
+*.safetensors filter=lfs diff=lfs merge=lfs -text

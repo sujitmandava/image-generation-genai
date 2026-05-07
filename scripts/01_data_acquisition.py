@@ -36,7 +36,7 @@ if HF_TOKEN is None:
 # ---------------------------------------------------------------------------
 
 DOWNLOAD_ALL_STYLES = False       # True -> use every style in the dataset.
-N_STYLES = 10          # Used only when DOWNLOAD_ALL_STYLES is False.
+N_STYLES = 8          # Used only when DOWNLOAD_ALL_STYLES is False.
 MAX_SIDE_PX = 512        # Resize so max(w, h) <= MAX_SIDE_PX.
 FORCE = False      # Re-download even if index.csv already exists.
 SEED = 42

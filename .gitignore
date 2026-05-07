@@ -1,10 +1,6 @@
 # Data and large artifacts
 data/
-checkpoints/
 outputs/
-*.pt
-*.pth
-*.ckpt
 
 # Python
 __pycache__/
