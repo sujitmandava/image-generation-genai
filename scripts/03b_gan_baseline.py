@@ -2,7 +2,13 @@
 
 One generator G(x, c) conditioned on a one-hot style, one discriminator D
 with a WGAN-GP src head and a style-classification head. Same skeleton as
-3a: Optuna tune + resume-from-checkpoint final training.
+3a: Optuna tune (or `--skip-tune` for manual HPs) + resume-from-checkpoint
+final training + early stopping on cycle L1.
+
+This baseline currently mode-collapses (see outputs/gan_translations.png)
+and is excluded from the head-to-head comparison in 04. It's kept here as
+a documented negative result; recovering it would likely require a
+perceptual cycle term and / or a learning-rate schedule.
 """
 
 from __future__ import annotations
@@ -39,6 +45,16 @@ def make_loader(ds, bs, shuffle, workers):
     return DataLoader(ds, batch_size=bs, shuffle=shuffle,
                       num_workers=workers, drop_last=shuffle,
                       persistent_workers=workers > 0)
+
+
+def cfg_matches(saved: dict | None, current: dict) -> bool:
+    """Lenient cfg-equality: every key in `saved` must match `current`."""
+    if not saved:
+        return False
+    for k, v in saved.items():
+        if k not in current or current[k] != v:
+            return False
+    return True
 
 
 def one_hot(y: torch.Tensor, n: int) -> torch.Tensor:
@@ -145,7 +161,7 @@ def load_or_init(cfg: GANConfig, device, force_restart: bool):
                              betas=(cfg.beta1, cfg.beta2))
     start_epoch, history, best_rec = 1, [], float("inf")
     ckpt = None if force_restart else load_checkpoint(latest, map_location=device)
-    if ckpt is not None and ckpt.get("cfg") == cfg.to_dict():
+    if ckpt is not None and cfg_matches(ckpt.get("cfg"), cfg.to_dict()):
         G.load_state_dict(ckpt["model_state"]["G"])
         D.load_state_dict(ckpt["model_state"]["D"])
         opt_g.load_state_dict(ckpt["optimizer_states"]["g"])
@@ -160,9 +176,14 @@ def load_or_init(cfg: GANConfig, device, force_restart: bool):
 
 
 def train_final(G, D, opt_g, opt_d, loader, start_epoch, history, best_rec,
-                cfg: GANConfig, device) -> list[dict]:
+                cfg: GANConfig, device, patience: int = 0) -> list[dict]:
+    """Train with optional early stopping on cycle-L1.
+
+    `patience <= 0` disables early stopping.
+    """
     latest = CHECKPOINTS_DIR / "gan_latest.pt"
     best   = CHECKPOINTS_DIR / "gan_best.pt"
+    epochs_no_improve = 0
     for epoch in range(start_epoch, cfg.epochs + 1):
         G.train(); D.train()
         step = 0
@@ -184,8 +205,13 @@ def train_final(G, D, opt_g, opt_d, loader, start_epoch, history, best_rec,
         improved = r_avg < best_rec
         if improved:
             best_rec = r_avg
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
         print(f"ep {epoch:02d} | d={d_avg:.3f}  g={g_avg:.3f}  rec={r_avg:.4f}"
-              + ("  [best]" if improved else ""))
+              + ("  [best]" if improved
+                 else f"  [no-improve {epochs_no_improve}/{patience}]"
+                 if patience > 0 else ""))
 
         save_checkpoint(
             latest, epoch=epoch,
@@ -199,6 +225,10 @@ def train_final(G, D, opt_g, opt_d, loader, start_epoch, history, best_rec,
                 model_state={"G": G.state_dict(), "D": D.state_dict()},
                 history=history, best_metric=best_rec, extra={"cfg": cfg.to_dict()},
             )
+        if patience > 0 and epochs_no_improve >= patience:
+            print(f"Early stopping at epoch {epoch} "
+                  f"(no improvement for {patience} epochs).")
+            break
     print("Done. Best rec:", best_rec)
     return history
 
@@ -244,6 +274,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-jobs",           type=int, default=1)
     p.add_argument("--n-loader-workers", type=int, default=4)
     p.add_argument("--force-restart",    action="store_true")
+    p.add_argument("--patience",         type=int, default=8,
+                   help="Early-stop after N epochs without cycle-L1 "
+                        "improvement. 0 disables early stopping.")
+
+    skip = p.add_argument_group(
+        "skip-tune", "Bypass Optuna and train with manual hyperparameters.")
+    skip.add_argument("--skip-tune",    action="store_true",
+                      help="Skip the Optuna search and use the manual HPs below.")
+    skip.add_argument("--lr-g",         type=float, default=1e-4)
+    skip.add_argument("--lr-d",         type=float, default=1e-4)
+    skip.add_argument("--lambda-cls",   type=float, default=1.0)
+    skip.add_argument("--lambda-rec",   type=float, default=10.0)
+    skip.add_argument("--n-res-blocks", type=int,   default=4)
     return p.parse_args()
 
 
@@ -262,16 +305,27 @@ def main() -> None:
     val_ds   = WikiArtDataset(splits / "val.csv",   root_dir=PROJECT_ROOT,
                               transform=build_transform(128, train=False))
 
-    study = tune(train_ds, args, n_styles, device)
-
-    best_cfg = GANConfig(
-        n_styles=n_styles, batch_size=args.batch_size,
-        epochs=args.final_epochs,
-        lr_g=study.best_params["lr_g"],
-        lr_d=study.best_params["lr_d"],
-        lambda_cls=study.best_params["lambda_cls"],
-        lambda_rec=study.best_params["lambda_rec"],
-    )
+    if args.skip_tune:
+        print("--skip-tune: using manual HPs.")
+        best_cfg = GANConfig(
+            n_styles=n_styles, batch_size=args.batch_size,
+            epochs=args.final_epochs,
+            lr_g=args.lr_g,
+            lr_d=args.lr_d,
+            lambda_cls=args.lambda_cls,
+            lambda_rec=args.lambda_rec,
+            n_res_blocks=args.n_res_blocks,
+        )
+    else:
+        study = tune(train_ds, args, n_styles, device)
+        best_cfg = GANConfig(
+            n_styles=n_styles, batch_size=args.batch_size,
+            epochs=args.final_epochs,
+            lr_g=study.best_params["lr_g"],
+            lr_d=study.best_params["lr_d"],
+            lambda_cls=study.best_params["lambda_cls"],
+            lambda_rec=study.best_params["lambda_rec"],
+        )
     print("Final cfg:", best_cfg)
 
     G, D, opt_g, opt_d, start_epoch, history, best_rec = load_or_init(
@@ -281,7 +335,7 @@ def main() -> None:
 
     loader = make_loader(train_ds, best_cfg.batch_size, True, args.n_loader_workers)
     history = train_final(G, D, opt_g, opt_d, loader, start_epoch, history,
-                          best_rec, best_cfg, device)
+                          best_rec, best_cfg, device, patience=args.patience)
     plot_and_translate(history, best_cfg, val_ds, styles, device)
 
 

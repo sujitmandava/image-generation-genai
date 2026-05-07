@@ -1,8 +1,14 @@
 """Step 3a - Vanilla beta-VAE baseline.
 
-1. Short Optuna hyperparameter search (concurrent trials via n_jobs).
-2. Final training with resume from checkpoints/vae_latest.pt.
+1. Short Optuna hyperparameter search (concurrent trials via n_jobs), or
+   skip the search entirely with --skip-tune + manual HP flags.
+2. Final training with resume from checkpoints/vae_latest.pt and optional
+   early stopping (--patience).
 3. Save checkpoints/vae_best.pt on val-loss improvement.
+
+The training objective is `MSE + beta * KL + lpips_w * LPIPS(x_hat, x)`.
+When `lpips_w > 0` (the default), a frozen VGG16 LPIPS network is used as
+a perceptual term so reconstructions are not pure pixel-MSE blur.
 """
 
 from __future__ import annotations
@@ -11,6 +17,7 @@ import argparse
 import sys
 from pathlib import Path
 
+import lpips
 import matplotlib.pyplot as plt
 import numpy as np
 import optuna
@@ -37,28 +44,55 @@ def make_loader(ds, bs, shuffle, workers):
                       persistent_workers=workers > 0)
 
 
-def run_epoch(model, loader, opt, cfg, device, train: bool) -> dict:
+def build_lpips(device, weight: float):
+    """Return a frozen LPIPS-VGG module if `weight > 0`, else None."""
+    if weight <= 0.0:
+        return None
+    fn = lpips.LPIPS(net="vgg").to(device).eval()
+    for p in fn.parameters():
+        p.requires_grad_(False)
+    return fn
+
+
+def run_epoch(model, loader, opt, cfg, device, train: bool,
+              lpips_fn=None) -> dict:
     model.train(train)
-    totals = {"loss": 0.0, "recon": 0.0, "kl": 0.0, "n": 0}
+    totals = {"loss": 0.0, "recon": 0.0, "kl": 0.0, "lpips": 0.0, "n": 0}
     ctx = torch.enable_grad() if train else torch.no_grad()
     with ctx:
         for x, _ in loader:
             x = x.to(device, non_blocking=True)
             out = model(x)
-            losses = vae_loss(out, x, cfg.beta)
+            losses = vae_loss(out, x, cfg.beta,
+                              lpips_fn=lpips_fn, lpips_w=cfg.lpips_w)
             if train:
                 opt.zero_grad(set_to_none=True)
                 losses["loss"].backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
                 opt.step()
             bs = x.size(0)
-            for k in ("loss", "recon", "kl"):
+            for k in ("loss", "recon", "kl", "lpips"):
                 totals[k] += losses[k].item() * bs
             totals["n"] += bs
-    return {k: totals[k] / totals["n"] for k in ("loss", "recon", "kl")}
+    return {k: totals[k] / totals["n"]
+            for k in ("loss", "recon", "kl", "lpips")}
 
 
-def tune(train_ds, val_ds, args, device) -> optuna.Study:
+def cfg_matches(saved: dict | None, current: dict) -> bool:
+    """Lenient cfg-equality: every key in `saved` must match `current`.
+
+    New fields added to the dataclass since `saved` was written are tolerated
+    so that adding e.g. `lpips_w` doesn't force every old run to restart.
+    """
+    if not saved:
+        return False
+    for k, v in saved.items():
+        if k not in current or current[k] != v:
+            return False
+    return True
+
+
+def tune(train_ds, val_ds, args, device, lpips_fn) -> optuna.Study:
     rng = np.random.default_rng(0)
     tune_train = Subset(train_ds, rng.choice(len(train_ds),
                         min(args.tune_subset, len(train_ds)), replace=False).tolist())
@@ -70,6 +104,7 @@ def tune(train_ds, val_ds, args, device) -> optuna.Study:
             latent_dim=trial.suggest_categorical("latent_dim", [128, 256, 512]),
             beta=trial.suggest_float("beta", 0.25, 4.0, log=True),
             lr=trial.suggest_float("lr", 5e-5, 5e-4, log=True),
+            lpips_w=args.lpips_weight,
             batch_size=args.batch_size,
             epochs=args.tune_epochs,
         )
@@ -78,8 +113,10 @@ def tune(train_ds, val_ds, args, device) -> optuna.Study:
         tl = make_loader(tune_train, cfg.batch_size, True, args.n_loader_workers)
         vl = make_loader(tune_val,   cfg.batch_size, False, args.n_loader_workers)
         for _ in range(cfg.epochs):
-            run_epoch(model, tl, opt, cfg, device, train=True)
-        return run_epoch(model, vl, opt, cfg, device, train=False)["recon"]
+            run_epoch(model, tl, opt, cfg, device, train=True,
+                      lpips_fn=lpips_fn)
+        return run_epoch(model, vl, opt, cfg, device, train=False,
+                         lpips_fn=lpips_fn)["recon"]
 
     study = optuna.create_study(direction="minimize",
                                 sampler=TPESampler(seed=42),
@@ -116,7 +153,7 @@ def load_or_init(best_cfg: VAEConfig, device, force_restart: bool):
 
     ckpt = None if force_restart else load_checkpoint(latest, map_location=device)
     if ckpt is not None:
-        if ckpt.get("cfg") != best_cfg.to_dict():
+        if not cfg_matches(ckpt.get("cfg"), best_cfg.to_dict()):
             print("Latest checkpoint cfg differs from current best cfg, restarting.")
         else:
             model.load_state_dict(ckpt["model_state"])
@@ -130,12 +167,22 @@ def load_or_init(best_cfg: VAEConfig, device, force_restart: bool):
 
 
 def train_final(model, opt, sched, train_loader, val_loader,
-                start_epoch, history, best_val, cfg, device) -> list[dict]:
+                start_epoch, history, best_val, cfg, device,
+                lpips_fn=None, patience: int = 0) -> list[dict]:
+    """Train with optional early stopping.
+
+    `patience` is the number of consecutive epochs without val-loss
+    improvement after which training stops. `patience <= 0` disables
+    early stopping (train for all `cfg.epochs`).
+    """
     latest = CHECKPOINTS_DIR / "vae_latest.pt"
     best = CHECKPOINTS_DIR / "vae_best.pt"
+    epochs_no_improve = 0
     for epoch in range(start_epoch, cfg.epochs + 1):
-        tr = run_epoch(model, train_loader, opt, cfg, device, train=True)
-        va = run_epoch(model, val_loader,   opt, cfg, device, train=False)
+        tr = run_epoch(model, train_loader, opt, cfg, device,
+                       train=True, lpips_fn=lpips_fn)
+        va = run_epoch(model, val_loader,   opt, cfg, device,
+                       train=False, lpips_fn=lpips_fn)
         sched.step()
         history.append({"epoch": epoch,
                         **{f"tr_{k}": v for k, v in tr.items()},
@@ -143,9 +190,16 @@ def train_final(model, opt, sched, train_loader, val_loader,
         improved = va["loss"] < best_val
         if improved:
             best_val = va["loss"]
-        print(f"ep {epoch:02d} | tr loss={tr['loss']:.4f} (recon={tr['recon']:.4f}) "
-              f"| va loss={va['loss']:.4f} (recon={va['recon']:.4f})"
-              + ("  [best]" if improved else ""))
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+        print(f"ep {epoch:02d} | tr loss={tr['loss']:.4f} (recon={tr['recon']:.4f}, "
+              f"lpips={tr['lpips']:.4f}) "
+              f"| va loss={va['loss']:.4f} (recon={va['recon']:.4f}, "
+              f"lpips={va['lpips']:.4f})"
+              + ("  [best]" if improved
+                 else f"  [no-improve {epochs_no_improve}/{patience}]"
+                 if patience > 0 else ""))
 
         save_checkpoint(
             latest, epoch=epoch, model_state=model.state_dict(),
@@ -160,6 +214,10 @@ def train_final(model, opt, sched, train_loader, val_loader,
                 history=history, best_metric=best_val,
                 extra={"cfg": cfg.to_dict()},
             )
+        if patience > 0 and epochs_no_improve >= patience:
+            print(f"Early stopping at epoch {epoch} "
+                  f"(no improvement for {patience} epochs).")
+            break
     print("Done. Best val_loss:", best_val)
     return history
 
@@ -216,6 +274,20 @@ def parse_args() -> argparse.Namespace:
                    help="Concurrent Optuna trials (keep 1 on single GPU).")
     p.add_argument("--n-loader-workers",  type=int, default=4)
     p.add_argument("--force-restart",     action="store_true")
+    p.add_argument("--patience",          type=int, default=8,
+                   help="Early-stop after N epochs without val-loss "
+                        "improvement. 0 disables early stopping.")
+    p.add_argument("--lpips-weight",      type=float, default=0.5,
+                   help="Weight on the LPIPS perceptual term in the VAE "
+                        "loss. 0 disables (pure MSE+KL).")
+
+    skip = p.add_argument_group(
+        "skip-tune", "Bypass Optuna and train with manual hyperparameters.")
+    skip.add_argument("--skip-tune", action="store_true",
+                      help="Skip the Optuna search and use the manual HPs below.")
+    skip.add_argument("--latent-dim", type=int, default=256)
+    skip.add_argument("--beta",       type=float, default=1.0)
+    skip.add_argument("--lr",         type=float, default=2e-4)
     return p.parse_args()
 
 
@@ -232,16 +304,32 @@ def main() -> None:
                               transform=build_transform(128, train=False))
     print(f"train={len(train_ds)}  val={len(val_ds)}")
 
-    study = tune(train_ds, val_ds, args, device)
-    plot_trials(study)
+    lpips_fn = build_lpips(device, args.lpips_weight)
+    if lpips_fn is not None:
+        print(f"Perceptual loss enabled (lpips_w={args.lpips_weight}).")
 
-    best_cfg = VAEConfig(
-        latent_dim=study.best_params["latent_dim"],
-        beta=study.best_params["beta"],
-        lr=study.best_params["lr"],
-        batch_size=args.batch_size,
-        epochs=args.final_epochs,
-    )
+    if args.skip_tune:
+        print(f"--skip-tune: using manual HPs "
+              f"latent_dim={args.latent_dim}, beta={args.beta}, lr={args.lr}.")
+        best_cfg = VAEConfig(
+            latent_dim=args.latent_dim,
+            beta=args.beta,
+            lr=args.lr,
+            lpips_w=args.lpips_weight,
+            batch_size=args.batch_size,
+            epochs=args.final_epochs,
+        )
+    else:
+        study = tune(train_ds, val_ds, args, device, lpips_fn)
+        plot_trials(study)
+        best_cfg = VAEConfig(
+            latent_dim=study.best_params["latent_dim"],
+            beta=study.best_params["beta"],
+            lr=study.best_params["lr"],
+            lpips_w=args.lpips_weight,
+            batch_size=args.batch_size,
+            epochs=args.final_epochs,
+        )
     print("Final config:", best_cfg)
 
     model, opt, sched, start_epoch, history, best_val = load_or_init(
@@ -252,7 +340,8 @@ def main() -> None:
     train_loader = make_loader(train_ds, best_cfg.batch_size, True, args.n_loader_workers)
     val_loader   = make_loader(val_ds,   best_cfg.batch_size, False, args.n_loader_workers)
     history = train_final(model, opt, sched, train_loader, val_loader,
-                          start_epoch, history, best_val, best_cfg, device)
+                          start_epoch, history, best_val, best_cfg, device,
+                          lpips_fn=lpips_fn, patience=args.patience)
     plot_curves_and_samples(history, best_cfg, val_loader, device)
 
 

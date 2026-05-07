@@ -118,6 +118,7 @@ class VAEConfig:
     base_ch: int = 96
     latent_dim: int = 384
     beta: float = 1.0
+    lpips_w: float = 0.0
     lr: float = 2e-4
     batch_size: int = 64
     epochs: int = 25
@@ -154,11 +155,22 @@ class VanillaVAE(nn.Module):
         return {"x_hat": self.decode(z), "mu": mu, "lv": lv, "z": z}
 
 
-def vae_loss(out: dict, x: torch.Tensor, beta: float) -> dict:
+def vae_loss(out: dict, x: torch.Tensor, beta: float,
+             lpips_fn: nn.Module | None = None,
+             lpips_w: float = 0.0) -> dict:
+    """beta-VAE objective + optional LPIPS perceptual term.
+
+    `lpips_fn` is expected to be a frozen `lpips.LPIPS` module; both inputs
+    must already be in [-1, 1] (which is what `build_transform` produces).
+    """
     recon = F.mse_loss(out["x_hat"], x, reduction="mean")
     kl_per_sample = -0.5 * (1 + out["lv"] - out["mu"].pow(2) - out["lv"].exp()).sum(1)
     kl = kl_per_sample.mean() / (x.shape[1] * x.shape[2] * x.shape[3])
-    return {"loss": recon + beta * kl, "recon": recon, "kl": kl}
+    perc = torch.zeros((), device=x.device)
+    if lpips_fn is not None and lpips_w > 0.0:
+        perc = lpips_fn(out["x_hat"], x).mean()
+    return {"loss": recon + beta * kl + lpips_w * perc,
+            "recon": recon, "kl": kl, "lpips": perc}
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +190,7 @@ class DisVAEConfig:
     beta_style: float = 0.5
     style_clf_w: float = 1.0
     adv_w: float = 0.1
+    lpips_w: float = 0.0
     lr: float = 2e-4
     batch_size: int = 64
     epochs: int = 30
@@ -247,19 +260,31 @@ class DisentangledVAE(nn.Module):
 
 
 def disvae_loss(out: dict, x: torch.Tensor, y: torch.Tensor,
-                cfg: DisVAEConfig) -> dict:
+                cfg: DisVAEConfig,
+                lpips_fn: nn.Module | None = None) -> dict:
+    """Disentangled-VAE objective with optional LPIPS perceptual term.
+
+    The `style_clf_w` term pulls style info into `z_s`; the negative
+    `adv_w` term pushes style info out of `z_c` (gradient-reversed via the
+    sign in the total). The optional LPIPS term sharpens reconstructions
+    in the same way as in the vanilla VAE.
+    """
     recon = F.mse_loss(out["x_hat"], x, reduction="mean")
     n_pix = x.shape[1] * x.shape[2] * x.shape[3]
     kl_c = (-0.5 * (1 + out["lv_c"] - out["mu_c"].pow(2) - out["lv_c"].exp())).sum(1).mean() / n_pix
     kl_s = (-0.5 * (1 + out["lv_s"] - out["mu_s"].pow(2) - out["lv_s"].exp())).sum(1).mean() / n_pix
     style_ce = F.cross_entropy(out["style_logits"], y)
     adv_ce = F.cross_entropy(out["adv_logits"], y)
+    perc = torch.zeros((), device=x.device)
+    if lpips_fn is not None and cfg.lpips_w > 0.0:
+        perc = lpips_fn(out["x_hat"], x).mean()
     total = (recon
              + cfg.beta_content * kl_c + cfg.beta_style * kl_s
              + cfg.style_clf_w * style_ce
-             - cfg.adv_w * adv_ce)
+             - cfg.adv_w * adv_ce
+             + cfg.lpips_w * perc)
     return {"loss": total, "recon": recon, "kl_c": kl_c, "kl_s": kl_s,
-            "style_ce": style_ce, "adv_ce": adv_ce}
+            "style_ce": style_ce, "adv_ce": adv_ce, "lpips": perc}
 
 
 # ---------------------------------------------------------------------------

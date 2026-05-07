@@ -1,7 +1,13 @@
 """Step 3c - Disentangled VAE (content + style) baseline.
 
 Two-head VAE with a style classifier on z_s and an adversarial classifier on
-z_c. Same skeleton as 3a / 3b: Optuna HP tune + resume-from-checkpoint.
+z_c. Same skeleton as 3a / 3b: Optuna HP tune (or `--skip-tune` for manual
+hyperparameters) + resume-from-checkpoint + early stopping.
+
+Adds an optional LPIPS perceptual term to the reconstruction loss
+(`--lpips-weight`, default 0.5) so that the decoder is penalised for
+returning low-frequency blur, which was the dominant failure mode of the
+pure-MSE objective.
 """
 
 from __future__ import annotations
@@ -11,6 +17,7 @@ import json
 import sys
 from pathlib import Path
 
+import lpips
 import matplotlib.pyplot as plt
 import numpy as np
 import optuna
@@ -40,6 +47,26 @@ def make_loader(ds, bs, shuffle, workers):
                       persistent_workers=workers > 0)
 
 
+def build_lpips(device, weight: float):
+    """Return a frozen LPIPS-VGG module if `weight > 0`, else None."""
+    if weight <= 0.0:
+        return None
+    fn = lpips.LPIPS(net="vgg").to(device).eval()
+    for p in fn.parameters():
+        p.requires_grad_(False)
+    return fn
+
+
+def cfg_matches(saved: dict | None, current: dict) -> bool:
+    """Lenient cfg-equality: every key in `saved` must match `current`."""
+    if not saved:
+        return False
+    for k, v in saved.items():
+        if k not in current or current[k] != v:
+            return False
+    return True
+
+
 def split_params(model: DisentangledVAE):
     adv = list(model.adv_clf.parameters())
     adv_ids = {id(p) for p in adv}
@@ -47,9 +74,10 @@ def split_params(model: DisentangledVAE):
     return main, adv
 
 
-def train_step(model, x, y, cfg, opt_main, opt_adv) -> dict:
+def train_step(model, x, y, cfg, opt_main, opt_adv,
+               lpips_fn=None) -> dict:
     out = model(x)
-    losses = disvae_loss(out, x, y, cfg)
+    losses = disvae_loss(out, x, y, cfg, lpips_fn=lpips_fn)
     opt_main.zero_grad(set_to_none=True)
     losses["loss"].backward()
     main_params = [p for g in opt_main.param_groups for p in g["params"]]
@@ -64,7 +92,8 @@ def train_step(model, x, y, cfg, opt_main, opt_adv) -> dict:
     adv_loss.backward()
     opt_adv.step()
     return {"loss": losses["loss"].item(), "recon": losses["recon"].item(),
-            "style_ce": losses["style_ce"].item(), "adv_ce": adv_loss.item()}
+            "style_ce": losses["style_ce"].item(), "adv_ce": adv_loss.item(),
+            "lpips": losses["lpips"].item()}
 
 
 @torch.no_grad()
@@ -83,7 +112,8 @@ def eval_epoch(model, loader, device) -> dict:
             "adv_acc": tot["adv_hit"] / tot["n"]}
 
 
-def tune(train_ds, val_ds, args, n_styles: int, device) -> optuna.Study:
+def tune(train_ds, val_ds, args, n_styles: int, device,
+         lpips_fn) -> optuna.Study:
     rng = np.random.default_rng(0)
     tune_train = Subset(train_ds, rng.choice(len(train_ds),
                         min(args.tune_subset, len(train_ds)), replace=False).tolist())
@@ -101,7 +131,8 @@ def tune(train_ds, val_ds, args, n_styles: int, device) -> optuna.Study:
         for _ in range(cfg.epochs):
             model.train()
             for x, y in tl:
-                train_step(model, x.to(device), y.to(device), cfg, opt_main, opt_adv)
+                train_step(model, x.to(device), y.to(device), cfg,
+                           opt_main, opt_adv, lpips_fn=lpips_fn)
         return eval_epoch(model, vl, device)
 
     def objective(trial: optuna.Trial) -> float:
@@ -114,6 +145,7 @@ def tune(train_ds, val_ds, args, n_styles: int, device) -> optuna.Study:
             style_clf_w  =trial.suggest_float("style_clf_w",  0.5, 3.0, log=True),
             adv_w        =trial.suggest_float("adv_w",        0.05, 0.5, log=True),
             lr           =trial.suggest_float("lr",           5e-5, 5e-4, log=True),
+            lpips_w      =args.lpips_weight,
         )
         r = short_train(cfg)
         trial.set_user_attr("val_recon",   r["recon"])
@@ -145,7 +177,7 @@ def load_or_init(cfg: DisVAEConfig, device, force_restart: bool):
     start_epoch, history, best_val = 1, [], float("inf")
 
     ckpt = None if force_restart else load_checkpoint(latest, map_location=device)
-    if ckpt is not None and ckpt.get("cfg") == cfg.to_dict():
+    if ckpt is not None and cfg_matches(ckpt.get("cfg"), cfg.to_dict()):
         model.load_state_dict(ckpt["model_state"])
         opt_main.load_state_dict(ckpt["optimizer_states"]["main"])
         opt_adv.load_state_dict(ckpt["optimizer_states"]["adv"])
@@ -160,20 +192,28 @@ def load_or_init(cfg: DisVAEConfig, device, force_restart: bool):
 
 def train_final(model, opt_main, opt_adv, train_loader, val_loader,
                 start_epoch, history, best_val, cfg: DisVAEConfig,
-                device) -> list[dict]:
+                device, lpips_fn=None, patience: int = 0) -> list[dict]:
+    """Train with optional early stopping on val recon MSE.
+
+    `patience <= 0` disables early stopping.
+    """
     latest = CHECKPOINTS_DIR / "disvae_latest.pt"
     best   = CHECKPOINTS_DIR / "disvae_best.pt"
+    epochs_no_improve = 0
     for epoch in range(start_epoch, cfg.epochs + 1):
         model.train()
-        sums = {"loss": 0.0, "recon": 0.0, "style_ce": 0.0, "adv_ce": 0.0, "n": 0}
+        sums = {"loss": 0.0, "recon": 0.0, "style_ce": 0.0,
+                "adv_ce": 0.0, "lpips": 0.0, "n": 0}
         for x, y in tqdm(train_loader, desc=f"epoch {epoch}", leave=False):
             x, y = x.to(device), y.to(device)
-            info = train_step(model, x, y, cfg, opt_main, opt_adv)
+            info = train_step(model, x, y, cfg, opt_main, opt_adv,
+                              lpips_fn=lpips_fn)
             bs = x.size(0)
-            for k in ("loss", "recon", "style_ce", "adv_ce"):
+            for k in ("loss", "recon", "style_ce", "adv_ce", "lpips"):
                 sums[k] += info[k] * bs
             sums["n"] += bs
-        tr = {k: sums[k] / sums["n"] for k in ("loss", "recon", "style_ce", "adv_ce")}
+        tr = {k: sums[k] / sums["n"]
+              for k in ("loss", "recon", "style_ce", "adv_ce", "lpips")}
         va = eval_epoch(model, val_loader, device)
         history.append({"epoch": epoch,
                         **{f"tr_{k}": v for k, v in tr.items()},
@@ -181,10 +221,17 @@ def train_final(model, opt_main, opt_adv, train_loader, val_loader,
         improved = va["recon"] < best_val
         if improved:
             best_val = va["recon"]
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
         print(f"ep {epoch:02d} | tr recon={tr['recon']:.4f}  "
-              f"sty_ce={tr['style_ce']:.3f}  adv_ce={tr['adv_ce']:.3f} | "
+              f"sty_ce={tr['style_ce']:.3f}  adv_ce={tr['adv_ce']:.3f}  "
+              f"lpips={tr['lpips']:.3f} | "
               f"va recon={va['recon']:.4f}  sty_acc={va['sty_acc']:.2f}  "
-              f"adv_acc={va['adv_acc']:.2f}" + ("  [best]" if improved else ""))
+              f"adv_acc={va['adv_acc']:.2f}"
+              + ("  [best]" if improved
+                 else f"  [no-improve {epochs_no_improve}/{patience}]"
+                 if patience > 0 else ""))
 
         save_checkpoint(
             latest, epoch=epoch, model_state=model.state_dict(),
@@ -197,6 +244,10 @@ def train_final(model, opt_main, opt_adv, train_loader, val_loader,
                 history=history, best_metric=best_val,
                 extra={"cfg": cfg.to_dict()},
             )
+        if patience > 0 and epochs_no_improve >= patience:
+            print(f"Early stopping at epoch {epoch} "
+                  f"(no improvement for {patience} epochs).")
+            break
     print("Done. Best val_recon:", best_val)
     return history
 
@@ -279,10 +330,28 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-jobs",           type=int, default=1)
     p.add_argument("--n-loader-workers", type=int, default=4)
     p.add_argument("--force-restart",    action="store_true")
+    p.add_argument("--patience",         type=int, default=8,
+                   help="Early-stop after N epochs without val-recon "
+                        "improvement. 0 disables early stopping.")
+    p.add_argument("--lpips-weight",     type=float, default=0.5,
+                   help="Weight on the LPIPS perceptual term in the recon "
+                        "loss. 0 disables (pure MSE+KL).")
     p.add_argument("--test-image", type=str, default=None,
                    help="Path to a test content image for single-image style transfer.")
     p.add_argument("--style-image", type=str, default=None,
                    help="Optional path to style reference image. Defaults to --test-image.")
+
+    skip = p.add_argument_group(
+        "skip-tune", "Bypass Optuna and train with manual hyperparameters.")
+    skip.add_argument("--skip-tune",      action="store_true",
+                      help="Skip the Optuna search and use the manual HPs below.")
+    skip.add_argument("--latent-content", type=int,   default=128)
+    skip.add_argument("--latent-style",   type=int,   default=32)
+    skip.add_argument("--beta-content",   type=float, default=1.0)
+    skip.add_argument("--beta-style",     type=float, default=0.5)
+    skip.add_argument("--style-clf-w",    type=float, default=1.0)
+    skip.add_argument("--adv-w",          type=float, default=0.1)
+    skip.add_argument("--lr",             type=float, default=2e-4)
     return p.parse_args()
 
 
@@ -300,10 +369,32 @@ def main() -> None:
     val_ds   = WikiArtDataset(splits / "val.csv",   root_dir=PROJECT_ROOT,
                               transform=build_transform(128, train=False))
 
-    study = tune(train_ds, val_ds, args, n_styles, device)
+    lpips_fn = build_lpips(device, args.lpips_weight)
+    if lpips_fn is not None:
+        print(f"Perceptual loss enabled (lpips_w={args.lpips_weight}).")
 
-    best_cfg = DisVAEConfig(n_styles=n_styles, batch_size=args.batch_size,
-                            epochs=args.final_epochs, **study.best_params)
+    if args.skip_tune:
+        print("--skip-tune: using manual HPs.")
+        best_cfg = DisVAEConfig(
+            n_styles=n_styles, batch_size=args.batch_size,
+            epochs=args.final_epochs,
+            latent_content=args.latent_content,
+            latent_style=args.latent_style,
+            beta_content=args.beta_content,
+            beta_style=args.beta_style,
+            style_clf_w=args.style_clf_w,
+            adv_w=args.adv_w,
+            lpips_w=args.lpips_weight,
+            lr=args.lr,
+        )
+    else:
+        study = tune(train_ds, val_ds, args, n_styles, device, lpips_fn)
+        best_cfg = DisVAEConfig(
+            n_styles=n_styles, batch_size=args.batch_size,
+            epochs=args.final_epochs,
+            lpips_w=args.lpips_weight,
+            **study.best_params,
+        )
     print("Final cfg:", best_cfg)
 
     model, opt_main, opt_adv, start_epoch, history, best_val = load_or_init(
@@ -314,7 +405,8 @@ def main() -> None:
     train_loader = make_loader(train_ds, best_cfg.batch_size, True, args.n_loader_workers)
     val_loader   = make_loader(val_ds,   best_cfg.batch_size, False, args.n_loader_workers)
     history = train_final(model, opt_main, opt_adv, train_loader, val_loader,
-                          start_epoch, history, best_val, best_cfg, device)
+                          start_epoch, history, best_val, best_cfg, device,
+                          lpips_fn=lpips_fn, patience=args.patience)
     test_image = (Path(args.test_image).expanduser()
                   if args.test_image else None)
     style_image = (Path(args.style_image).expanduser()
