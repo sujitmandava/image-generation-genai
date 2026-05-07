@@ -17,6 +17,7 @@ import optuna
 import pandas as pd
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from optuna.samplers import TPESampler
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
@@ -200,8 +201,15 @@ def train_final(model, opt_main, opt_adv, train_loader, val_loader,
     return history
 
 
+def _load_eval_image(path: Path, image_size: int) -> torch.Tensor:
+    tfm = build_transform(image_size, train=False)
+    with Image.open(path) as im:
+        return tfm(im.convert("RGB"))
+
+
 def plot_and_transfer(history, cfg: DisVAEConfig, val_loader, n_styles: int,
-                      device) -> None:
+                      device, test_image: Path | None,
+                      style_image: Path | None) -> None:
     hdf = pd.DataFrame(history)
     fig, axes = plt.subplots(1, 3, figsize=(12, 3.5))
     axes[0].plot(hdf["epoch"], hdf["tr_recon"], label="train")
@@ -235,6 +243,31 @@ def plot_and_transfer(history, cfg: DisVAEConfig, val_loader, n_styles: int,
     fig.savefig(OUTPUTS_DIR / "disvae_transfer.png", dpi=120, bbox_inches="tight")
     plt.close(fig)
 
+    if test_image is not None:
+        style_source = style_image if style_image is not None else test_image
+        test_x = _load_eval_image(test_image, cfg.image_size).unsqueeze(0).to(device)
+        style_x = _load_eval_image(style_source, cfg.image_size).unsqueeze(0).to(device)
+        with torch.no_grad():
+            test_recon = model(test_x)["x_hat"]
+            test_transfer = model.transfer(test_x, style_x)
+        labeled = torch.cat([test_x.cpu(), style_x.cpu(), test_recon.cpu(),
+                             test_transfer.cpu()], dim=0)
+        titles = [
+            "TEST_IMAGE (content)",
+            "STYLE_REFERENCE",
+            "TEST_RECONSTRUCTION",
+            "STYLE_TRANSFER_OUTPUT",
+        ]
+        fig = show_grid(
+            labeled, titles=titles, ncols=4,
+            suptitle="DisVAE single-image style transfer (left to right labeled)"
+        )
+        fig.savefig(OUTPUTS_DIR / "disvae_test_image_transfer_labeled.png",
+                    dpi=140, bbox_inches="tight")
+        plt.close(fig)
+        print("Saved labeled test style transfer ->",
+              OUTPUTS_DIR / "disvae_test_image_transfer_labeled.png")
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
@@ -246,6 +279,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-jobs",           type=int, default=1)
     p.add_argument("--n-loader-workers", type=int, default=4)
     p.add_argument("--force-restart",    action="store_true")
+    p.add_argument("--test-image", type=str, default=None,
+                   help="Path to a test content image for single-image style transfer.")
+    p.add_argument("--style-image", type=str, default=None,
+                   help="Optional path to style reference image. Defaults to --test-image.")
     return p.parse_args()
 
 
@@ -278,7 +315,16 @@ def main() -> None:
     val_loader   = make_loader(val_ds,   best_cfg.batch_size, False, args.n_loader_workers)
     history = train_final(model, opt_main, opt_adv, train_loader, val_loader,
                           start_epoch, history, best_val, best_cfg, device)
-    plot_and_transfer(history, best_cfg, val_loader, n_styles, device)
+    test_image = (Path(args.test_image).expanduser()
+                  if args.test_image else None)
+    style_image = (Path(args.style_image).expanduser()
+                   if args.style_image else None)
+    if test_image is not None and not test_image.is_absolute():
+        test_image = PROJECT_ROOT / test_image
+    if style_image is not None and not style_image.is_absolute():
+        style_image = PROJECT_ROOT / style_image
+    plot_and_transfer(history, best_cfg, val_loader, n_styles, device,
+                      test_image=test_image, style_image=style_image)
 
 
 if __name__ == "__main__":

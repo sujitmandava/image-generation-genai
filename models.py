@@ -19,10 +19,17 @@ import torch.nn.functional as F
 # ---------------------------------------------------------------------------
 
 
+def _num_groups(ch: int) -> int:
+    for g in (8, 4, 2, 1):
+        if ch % g == 0:
+            return g
+    return 1
+
+
 def _conv(c_in: int, c_out: int) -> nn.Sequential:
     return nn.Sequential(
         nn.Conv2d(c_in, c_out, 4, stride=2, padding=1),
-        nn.GroupNorm(8, c_out),
+        nn.GroupNorm(_num_groups(c_out), c_out),
         nn.SiLU(inplace=True),
     )
 
@@ -30,9 +37,45 @@ def _conv(c_in: int, c_out: int) -> nn.Sequential:
 def _deconv(c_in: int, c_out: int) -> nn.Sequential:
     return nn.Sequential(
         nn.ConvTranspose2d(c_in, c_out, 4, stride=2, padding=1),
-        nn.GroupNorm(8, c_out),
+        nn.GroupNorm(_num_groups(c_out), c_out),
         nn.SiLU(inplace=True),
     )
+
+
+class _ResBlockGN(nn.Module):
+    def __init__(self, ch: int) -> None:
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(ch, ch, 3, 1, 1, bias=False),
+            nn.GroupNorm(_num_groups(ch), ch),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(ch, ch, 3, 1, 1, bias=False),
+            nn.GroupNorm(_num_groups(ch), ch),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.body(x)
+
+
+class _SelfAttention2d(nn.Module):
+    def __init__(self, ch: int) -> None:
+        super().__init__()
+        self.norm = nn.GroupNorm(_num_groups(ch), ch)
+        self.q = nn.Conv2d(ch, ch, 1, bias=False)
+        self.k = nn.Conv2d(ch, ch, 1, bias=False)
+        self.v = nn.Conv2d(ch, ch, 1, bias=False)
+        self.proj = nn.Conv2d(ch, ch, 1)
+        self.scale = ch ** -0.5
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        y = self.norm(x)
+        q = self.q(y).reshape(b, c, h * w).transpose(1, 2)
+        k = self.k(y).reshape(b, c, h * w)
+        v = self.v(y).reshape(b, c, h * w).transpose(1, 2)
+        attn = torch.softmax((q @ k) * self.scale, dim=-1)
+        out = (attn @ v).transpose(1, 2).reshape(b, c, h, w)
+        return x + self.proj(out)
 
 
 def _build_encoder(in_ch: int, base: int) -> tuple[nn.Sequential, int]:
@@ -42,12 +85,18 @@ def _build_encoder(in_ch: int, base: int) -> tuple[nn.Sequential, int]:
         _conv(base * 2, base * 4),# 16
         _conv(base * 4, base * 8),# 8
         _conv(base * 8, base * 8),# 4
+        _ResBlockGN(base * 8),
+        _SelfAttention2d(base * 8),
+        _ResBlockGN(base * 8),
     )
     return net, base * 8 * 4 * 4
 
 
 def _build_decoder(out_ch: int, base: int) -> nn.Sequential:
     return nn.Sequential(
+        _ResBlockGN(base * 8),
+        _SelfAttention2d(base * 8),
+        _ResBlockGN(base * 8),
         _deconv(base * 8, base * 8),  # 8
         _deconv(base * 8, base * 4),  # 16
         _deconv(base * 4, base * 2),  # 32
@@ -66,8 +115,8 @@ def _build_decoder(out_ch: int, base: int) -> nn.Sequential:
 class VAEConfig:
     image_size: int = 128
     in_channels: int = 3
-    base_ch: int = 64
-    latent_dim: int = 256
+    base_ch: int = 96
+    latent_dim: int = 384
     beta: float = 1.0
     lr: float = 2e-4
     batch_size: int = 64

@@ -191,12 +191,16 @@ def plot_curves_and_samples(history: list[dict], cfg: VAEConfig,
     with torch.no_grad():
         out = model(x)
         samples = model.decode(torch.randn(8, cfg.latent_dim, device=device))
-    fig = show_grid(torch.cat([x.cpu(), out["x_hat"].cpu()], dim=0),
+    recon_grid = torch.cat([x.cpu(), out["x_hat"].cpu()], dim=0)
+    recon_titles = [f"INPUT_{i+1}" for i in range(8)] + [f"RECON_{i+1}" for i in range(8)]
+    fig = show_grid(recon_grid, titles=recon_titles,
                     ncols=8,
-                    suptitle="VAE top=input | bottom=reconstruction")
+                    suptitle="VAE reconstruction grid (top: input, bottom: reconstruction)")
     fig.savefig(OUTPUTS_DIR / "vae_recon.png", dpi=120, bbox_inches="tight")
     plt.close(fig)
-    fig = show_grid(samples.cpu(), ncols=8, suptitle="VAE prior samples")
+    sample_titles = [f"PRIOR_SAMPLE_{i+1}" for i in range(8)]
+    fig = show_grid(samples.cpu(), titles=sample_titles, ncols=8,
+                    suptitle="VAE prior samples")
     fig.savefig(OUTPUTS_DIR / "vae_samples.png", dpi=120, bbox_inches="tight")
     plt.close(fig)
 
