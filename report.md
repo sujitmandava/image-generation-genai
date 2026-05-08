@@ -1,32 +1,29 @@
 # WikiArt Style Transfer - Project Report
 
-A comparative study of three latent-variable models for art-style
+A comparative study of latent-variable models for art-style
 transfer on `huggan/wikiart`: a vanilla beta-VAE, a disentangled VAE
-with separate content (`z_c`) and style (`z_s`) latents, and a
-StarGAN. The two VAEs are compared in `04_result_analysis.py`; the
+with separate content (`z_c`) and style (`z_s`) latents (in two
+training variants - pure MSE and MSE + LPIPS perceptual loss), and a
+StarGAN. The three VAEs are compared in `04_result_analysis.py`; the
 StarGAN is reported as a documented negative result.
 
 For setup and CLI flags see [`README.md`](README.md). This report
-focuses on what is actually in `outputs/`.
+focuses on the findings, difficulties, and future work related to this project.
 
 ## 1. Dataset
 
 8 of the 27 WikiArt styles, totalling **38 252** images, restricted
 this way for **compute**: the full dataset at 128x128 with three
-architectures and Optuna search did not fit our single-GPU budget.
+architectures and Optuna search did not fit the single-GPU budget.
 The 8 chosen styles are visually distinct (figurative, expressive,
 abstract, graphic, dramatic) so style transfer between any two is
-meaningful. Stratified 80/10/10 split: 30 601 / 3 825 / 3 826.
+meaningful. Stratified 80/10/10 split: 30,601 / 3,825 / 3,826.
 
 The class distribution is heavily imbalanced (~11x ratio):
 
 | Impressionism | Realism | Baroque | Abs.Exp. | N.Renaissance | Cubism | Pop_Art | Ukiyo_e |
 |---:|---:|---:|---:|---:|---:|---:|---:|
 | 13 000 | 10 600 | 4 200 | 2 800 | 2 600 | 2 200 | 1 500 | 1 200 |
-
-We do not re-balance; the GAN's auxiliary classifier and the ResNet18
-judge in `04` consequently have a strong prior toward Impressionism
-and Realism. See `outputs/01_style_counts.png`.
 
 ## 2. Architecture choices (`models.py`)
 
@@ -40,11 +37,18 @@ class imbalance and small batches.
   -> 4-deconv decoder + `Tanh`. Defaults: `latent_dim=384`, `beta=1.0`.
   Loss: `MSE + beta * KL`.
 - **Disentangled VAE.** Same backbone, two heads: `z_c` (128-dim,
-  content) and `z_s` (32-dim, style). Decoder takes `cat(z_c, z_s)`.
-  Asymmetric sizes act as an information bottleneck on style. Two
-  classifiers: a positive one on `z_s` (pulls style *into* `z_s`) and
-  an adversarial one on `z_c` (pushes style *out of* `z_c`, trained
-  alternately as a one-step gradient-reversal proxy).
+  content) and `z_s` (16- or 32-dim, style). Decoder takes
+  `cat(z_c, z_s)`. Asymmetric sizes act as an information bottleneck
+  on style. Two classifiers: a positive one on `z_s` (pulls style
+  *into* `z_s`) and an adversarial one on `z_c` (pushes style *out
+  of* `z_c`, trained alternately as a one-step gradient-reversal
+  proxy). Two checkpoints are compared:
+  - **DisVAE (MSE)**: `MSE + beta_c*KL_c + beta_s*KL_s + style_clf_w*CE - adv_w*CE`.
+  - **DisVAE + LPIPS**: same loss + `lpips_w * LPIPS(x_hat, x)` with
+    `lpips_w = 0.5`. Trains the modern (`_ResBlockGN` +
+    `_SelfAttention2d`) backbone end-to-end; the MSE-only checkpoint
+    pre-dates that refactor and is loaded via a small compatibility
+    shim in `04`.
 - **StarGAN.** Direct port of [Choi et al. 2018](https://arxiv.org/abs/1711.09020)
   with WGAN-GP swapping in for LSGAN. Generator concatenates the
   one-hot target style spatially; discriminator has src + cls heads;
@@ -54,104 +58,127 @@ class imbalance and small batches.
 
 | Script | What it does |
 |---|---|
-| `01_data_acquisition.py` | Stream `huggan/wikiart`, filter to 8 styles, downsize, save to `data/raw/`. Configured by constants at the top of the file (no `argparse`). |
+| `01_data_acquisition.py` | Stream `huggan/wikiart`, filter to 8 styles, downsize, save to `data/raw/`.|
 | `02_data_preprocessing.py` | Resize/center-crop to 128x128, save to `data/processed/`, write stratified 80/10/10 splits + manifest. Multiprocessed. |
-| `03a_vae_baseline.py` | Optuna TPE over `(latent_dim, beta, lr)` (or `--skip-tune`), then full training with cosine LR, checkpoint resume, `--patience` early stopping. |
-| `03b_gan_baseline.py` | Same skeleton; sweeps `(lr_g, lr_d, lambda_cls, lambda_rec)`; trains G/D with `n_critic=5`. |
+| `03a_vae_baseline.py` | Optuna TPE for hyperparameter tuning, then full training with cosine LR, checkpoint resume, `--patience` early stopping. |
+| `03b_gan_baseline.py` | Same skeleton; trains Generator/Discriminator with `n_critic=5`. |
 | `03c_disentangled_vae.py` | Same skeleton; two optimizers (main + adversarial), alternated each step. |
-| `04_result_analysis.py` | Loads `vae2_best.pt` + `disvae_best.pt`, trains a ResNet18 style judge, scores recon MSE on the test split + style-transfer accuracy + LPIPS-to-content for the DisVAE. |
+| `04_result_analysis.py` | Loads `vae2_best.pt`, `disvae_best.pt`, and `disvae_best2.pt` (the LPIPS-trained DisVAE), trains a ResNet18 style judge, and scores test-split recon MSE for all three plus style-transfer accuracy + LPIPS-to-content for the two DisVAE variants. |
 
-> **Stored checkpoints were trained without the LPIPS perceptual term.**
-> The training scripts now support `--lpips-weight W`
-> (`MSE + beta*KL + W*LPIPS(x_hat, x)`) but the saved weights pre-date
-> that change. Retraining with `W=0.5` is the highest-leverage
-> remaining task and is left as future work.
->
-> Also: the saved `disvae_best.pt` is from an earlier `models.py`
-> revision (no `_ResBlockGN` / `_SelfAttention2d`) and is loaded via a
-> compatibility shim (`_LegacyDisentangledVAE`) inside `04`. The shim
-> can be deleted once DisVAE is retrained.
+> **Checkpoint provenance.** `vae2_best.pt` and `disvae_best.pt`
+> pre-date the LPIPS-aware training loop and were trained with pure
+> MSE+KL. The `disvae_best.pt` weights additionally pre-date the
+> `_ResBlockGN` / `_SelfAttention2d` refactor in `models.py`, and
+> are loaded via a `_LegacyDisentangledVAE` compatibility shim
+> inside `04`. The third checkpoint -
+> `disvae_best2.pt` - was retrained
+> end-to-end on the current architecture with `lpips_w = 0.5` and
+> loads through the standard `DisentangledVAE` class, so the shim is
+> only needed for the older MSE-only DisVAE.
 
 ## 4. Results
+
+Aggregate metrics on the held-out test split (N=200 transfer pairs):
 
 | Model | Test recon MSE | Style-transfer acc | Content LPIPS |
 |---|---:|---:|---:|
 | VAE-2 | **0.0361** | -- | -- |
-| Disentangled VAE | 0.0538 | 0.18 | 0.6942 |
+| DisVAE (MSE) | 0.0538 | **0.180** | 0.694 |
+| DisVAE + LPIPS | 0.0625 | 0.145 | **0.529** |
 
-Random chance on 8 styles = 0.125; DisVAE is ~5pp above. Per-style:
+Random chance on 8 styles = 0.125. Both DisVAE variants land just
+above chance on overall transfer accuracy. The LPIPS-trained variant
+has higher pixel MSE but ~24% lower content-LPIPS - exactly the
+perceptual-vs-pixel trade-off the term is designed to introduce.
 
-| Target style | Acc | LPIPS |
-|---|---:|---:|
-| Impressionism | 0.05 | 0.72 |
-| Cubism | 0.00 | 0.69 |
-| Ukiyo_e | 0.00 | 0.69 |
-| Baroque | 0.00 | 0.68 |
-| Pop_Art | 0.09 | 0.70 |
-| **Abstract_Expressionism** | **0.76** | 0.68 |
-| **Realism** | **0.54** | 0.70 |
-| Northern_Renaissance | 0.00 | 0.70 |
+Per target style (acc / content-LPIPS, lower is better for LPIPS):
+
+| Target style | DisVAE (MSE) acc | DisVAE (MSE) LPIPS | DisVAE + LPIPS acc | DisVAE + LPIPS LPIPS |
+|---|---:|---:|---:|---:|
+| Impressionism | 0.05 | 0.72 | **0.30** | **0.53** |
+| Cubism | 0.00 | 0.69 | 0.00 | **0.52** |
+| Ukiyo_e | 0.00 | 0.69 | 0.00 | **0.53** |
+| Baroque | 0.00 | 0.68 | 0.00 | **0.49** |
+| Pop_Art | 0.09 | 0.70 | 0.06 | **0.55** |
+| **Abstract_Expressionism** | **0.76** | 0.68 | 0.36 | **0.53** |
+| **Realism** | **0.54** | 0.70 | 0.50 | **0.54** |
+| Northern_Renaissance | 0.00 | 0.70 | 0.00 | **0.52** |
+
+LPIPS preservation is uniformly stronger across every target style
+(~0.05-0.20 lower); accuracy redistributes rather than improves -
+gains on Impressionism, losses on Abstract_Expressionism.
 
 Reading the figures in `outputs/`:
 
-- **`qualitative_reconstruction.png` / `vae_recon.png`.** Both VAEs
-  recover dominant colour and rough composition but lose all
-  high-frequency detail (faces -> smears, brushwork -> flat blocks).
-  Standard pure-MSE Gaussian-decoder failure mode; LPIPS would fix it.
-- **`recon_mse_compare.png`.** VAE-2 (0.036) edges out DisVAE (0.054)
-  on pixel MSE - expected, since DisVAE divides capacity between
-  `z_c` / `z_s` and pays for two classifier terms.
+- **`qualitative_reconstruction.png` / `vae_recon.png`.** All three
+  VAEs recover dominant colour and rough composition. VAE-2 and the
+  MSE-only DisVAE produce the standard low-frequency blur of a
+  pure-MSE Gaussian decoder (faces -> smears, brushwork -> flat
+  blocks). The LPIPS-trained DisVAE row visibly recovers more
+  texture and edges - notice the canvas weave returning - at the
+  cost of slight high-frequency artefacts.
+- **`recon_mse_compare.png`.** VAE-2 (0.036) < DisVAE-MSE (0.054) <
+  DisVAE-LPIPS (0.063) on pixel MSE. The ordering between the two
+  DisVAEs is *expected and not a regression*: optimising perceptual
+  similarity allows individual pixels to drift as long as VGG
+  feature responses match.
 - **`vae_samples.png`.** Sampling `z ~ N(0, I)` produces brown/cream
   noise. KL is tiny and *increasing* during training (see
   `vae_training_curves.png`); with `beta=0.256` (Optuna's pick) the
   prior is unusable as a generator.
-- **`compare_training_curves.png`.** VAE-2 train/val curves are tight
-  and still descending at epoch 30 (undertrained). DisVAE's
+- **`compare_training_curves.png`.** VAE-2 train/val curves are
+  tight and still descending at epoch 30 (undertrained). DisVAE's
   `z_s -> style` classifier plateaus at **0.39** (above chance, but
   weak) while the adversarial `z_c -> style` plateaus at **0.16**
-  (near chance). Reading: `z_c` is roughly style-invariant (good),
-  `z_s` only weakly captures style (bad). Suggests `style_clf_w`
-  should be raised in the next sweep.
+  (near chance). The DisVAE+LPIPS panel additionally overlays the
+  perceptual-loss curve, which descends smoothly throughout
+  training - i.e. the LPIPS term does not stall under the same
+  Optuna-picked weights as the MSE-only run. Reading: `z_c` is
+  roughly style-invariant (good), `z_s` only weakly captures style
+  (bad). `style_clf_w` should be raised in the next sweep.
 - **`qualitative_style_transfer.png` + `style_transfer_per_style.png`.**
-  4/8 target styles transfer at exactly 0%. Two textural styles
-  (Abs.Exp., Realism) score suspiciously high; without judge
-  validation on real images we can't tell whether the model succeeded
-  on those classes or the judge is firing on global colour stats.
-  LPIPS-to-content is uniform at ~0.69 across all targets, which is
-  itself diagnostic - real style transfer would preserve content
-  unevenly across "easy" and "hard" target styles. Combined with the
-  qualitative panel (transfers don't look like the target style and
-  partially erase content), the picture is: the decoder is collapsing
-  to a *style prototype* rather than re-rendering content.
+  Both DisVAE variants leave 4-5 of 8 target styles at exactly 0%.
+  Two textural styles (Abs.Exp., Realism) score above chance for
+  both; the LPIPS variant additionally lifts Impressionism from 5%
+  to 30%. Without judge validation on real images these are hard to
+  call as real successes vs. global-colour shortcuts. The qualitative
+  panel shows the same story as the metrics: the LPIPS row is
+  sharper and closer to the content image, while the MSE row is
+  blurrier but occasionally swings further toward the target style.
+  The decoder still mostly collapses to a *style prototype* rather
+  than re-rendering content.
 - **`gan_translations.png` + `gan_training_curves.png`.** Mode
   collapse. Every row is near-identical regardless of target style;
   within each row the generator outputs only 2-3 distinct images. D
-  loss bounces chaotically after epoch 5; cycle-L1 still descends but
-  is satisfied trivially by `G(x, c) ≈ x`. Excluded from the
+  loss bounces chaotically after epoch 5; cycle-L1 still descends
+  but is satisfied trivially by `G(x, c) ≈ x`. Excluded from the
   comparison in `04`.
 - **`vae_optuna_scatter.png`.** Best `beta ≈ 0.69`, best
   `lr ≈ 1.4e-4`. `latent_dim` only weakly correlated with val recon -
   capacity is not the bottleneck, reconstruction quality is.
 
-Headline conclusions:
+Conclusions:
 
 | Question | Answer |
 |---|---|
-| VAE reconstructs WikiArt? | Yes in MSE, no qualitatively (blurry). |
+| VAE reconstructs WikiArt? | Yes in MSE, no qualitatively (blurry without LPIPS). |
 | VAE generates from prior? | No (KL too small under low `beta`). |
-| DisVAE disentangles style/content? | Partially - `z_c` clean, `z_s` weak. |
-| DisVAE transfers art style? | **No.** 18% mean acc; 4/8 styles at 0%. |
+| DisVAE disentangles style/content? | Partially - `z_c` clean, `z_s` weak. Can be improved upon with changes to model architecture and training approach.|
+| LPIPS helps DisVAE? | **For content preservation, yes** (-24% LPIPS); for transfer accuracy, no (15% vs 18%). |
+| DisVAE transfers art style? | **No.** Both variants ~chance overall; only Abs.Exp. and Realism work. |
 | StarGAN works? | **No.** Mode-collapsed. |
 
 ## 5. Caveats
 
-These results do not let us claim more than the above because:
+These results do not support claims beyond the above because:
 
 1. **The judge is not validated on real test images.** Without that
    ceiling, transfer-accuracy numbers are not interpretable in
-   absolute terms.
-2. **The shipped DisVAE uses a legacy compat shim** in `04` rather
-   than the current architecture.
+   absolute terms - the gap between "the model succeeded" and "the
+   judge fired on global colour stats" cannot be told apart.
+2. **The MSE-only DisVAE uses a legacy compat shim** in `04` rather
+   than the current architecture; only the LPIPS variant exercises
+   the modern `_ResBlockGN` + `_SelfAttention2d` backbone.
 3. **No FID / SSIM / perceptual recon metric** in `summary.csv`
    despite `pytorch-fid` being a dependency.
 4. **N=200 transfer pairs**; Ukiyo_e and Pop_Art per-style accuracies
@@ -159,26 +186,70 @@ These results do not let us claim more than the above because:
 5. **No latent-space probe** (t-SNE/UMAP of `z_s`/`z_c`) - the
    "DisVAE achieves disentanglement" claim rests on two scalar
    classifier accuracies.
+6. **The two DisVAE variants are not architecturally identical.**
+   The MSE-only checkpoint is the legacy backbone; the LPIPS
+   checkpoint is the modern backbone. Some of the LPIPS-vs-MSE delta
+   is therefore confounded with the architectural delta.
 
-## 6. Future work (priority order)
+## 6. Future work
 
-1. **Retrain VAEs with `--lpips-weight 0.5`.** Single-GPU overnight;
-   fixes the dominant blur failure mode.
-2. **Validate the style judge** on real test images (one line in
-   `04`).
-3. **Per-style FID** using `pytorch-fid` (already a dep).
-4. **UMAP of `z_s` / `z_c`** colored by ground-truth style - direct
-   evidence for or against disentanglement.
-5. **Strengthen `style_clf_w`** in DisVAE; current value caps `z_s`
-   accuracy at ~0.39.
-6. **Retrain DisVAE** on the current architecture so the legacy shim
-   can be deleted.
-7. **Recover the StarGAN** with a perceptual cycle term + lower D LR,
-   or replace with CycleGAN per pair.
-8. **LPIPS-to-style-reference** alongside LPIPS-to-content.
-9. **Confusion matrix** for style transfer (shows which prototype
-   the model collapses onto).
-10. **Latent traversal grids** for DisVAE.
+A roadmap, not a backlog. Three workstreams, in the order they should
+be tackled - each one unlocks the next.
 
-Items 1-4 between them would convert this from a documented set of
-failure modes into a publishable comparative study.
+### A. Sharpen reconstructions (fix the blur)
+
+The dominant qualitative failure mode of both VAEs is low-frequency
+blur. The DisVAE+LPIPS run already showed that a perceptual loss
+recovers texture. The remaining work is to bring the vanilla VAE to
+parity and explore how far perceptual training can be pushed.
+
+1. **Retrain the vanilla VAE with a perceptual loss.** Same recipe
+   that worked on the DisVAE; expected to remove most of the VAE-2
+   blur in a single overnight run.
+2. **Sweep the perceptual weight.** A single value (0.5) was tried;
+   a small sweep would tell whether texture recovery has further
+   headroom or whether other terms (e.g. total variation) are
+   needed.
+
+### B. Optimize learning of the latent space
+
+The disentanglement claim currently rests on two scalar classifier
+accuracies. The latents need to be both *measured* better and
+*pushed* harder.
+
+3. **Strengthen the disentanglement signal.** The current sweep
+   ranges leave the style classifier weak and the adversary too
+   gentle - results in a `z_s` that holds only loose style
+   information. Re-tune with wider hyperparameter ranges so the two
+   latents actually specialize.
+4. **Look inside the latents.** Add a latent-space probe (a 2D
+   projection of `z_c` and `z_s` colored by ground-truth style, plus
+   a few traversal grids). Either confirms the disentanglement story
+   or shows where it breaks.
+5. **Put both DisVAE variants on the same backbone.** The MSE-only
+   DisVAE still uses the legacy architecture; retraining it on the
+   current one removes the architectural confound from the
+   LPIPS-vs-MSE comparison and lets the legacy compatibility shim
+   in `04` be deleted.
+
+### C. Better style transfer
+
+Both DisVAE variants flatline near chance because the training
+objective never grades the operation that evaluation measures.
+Closing that gap is the single biggest accuracy lever left.
+
+6. **Grade the model on the swap, not just the autoencode.** Add a
+   style-classification loss on the transferred output and a
+   content cycle-consistency term, so the model is rewarded when
+   "encode content + encode style + decode" actually produces an
+   image of the target style with the source's content.
+7. **Make the evaluation trustworthy and informative.** Validate
+   the style judge on real test images (sets a ceiling for
+   transfer-accuracy numbers), use a mean-style reference instead
+   of a single random one, and report a confusion matrix so it's
+   visible which target style the model collapses onto.
+
+## 7. Difficulties faced
+
+1. Hardware Constraints: Training the model locally took a long time as I use a Macbook Air. Training it on collab multiple times caused my compute to run out. Jobs on the HPC stalled with no error logs, which meant a lot of wasted time. 
+2. Designing the architectures: Simple models performed very poorly. 2-3 iterations of architectures and models showed little to no performance improvements. Combined with the hardware constraints, there was little to no improvement in this regard.
