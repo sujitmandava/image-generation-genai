@@ -1,6 +1,5 @@
 # Data and large artifacts
 data/
-outputs/
 
 # Python
 __pycache__/

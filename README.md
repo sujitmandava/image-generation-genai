@@ -118,6 +118,8 @@ long as the saved config still matches the current one (any keys
 present in the saved config must agree; new keys added later are
 tolerated). Pass `--force-restart` to start over.
 
+Link to models: https://drive.google.com/drive/folders/1TKWGW4s3fuwEctROYnlkanNOgGZWlpyq?usp=sharing
+
 ## CLI flags
 
 ### Training scripts (03a / 03b / 03c) - common
