@@ -1,11 +1,20 @@
 """Step 4 - Result analysis.
 
-Loads checkpoints/{vae2,disvae}_best.pt, trains a small ResNet18 style judge,
-and compares the two models on the held-out test split:
+Loads three checkpoints and compares them on the held-out test split:
 
-  * Reconstruction MSE (both models).
-  * Art-style transfer accuracy + LPIPS-to-content (DisVAE; the only one of
-    the two that supports a content/style swap via z_c, z_s).
+  * checkpoints/vae2_best.pt                                 -> "VAE-2"
+  * checkpoints/disvae_best.pt                               -> "DisVAE"
+  * checkpoints/image-generation-genai_checkpoints_disvae_best.pt
+                                                             -> "DisVAE + LPIPS"
+    (same DisentangledVAE architecture as `disvae`, but trained with an
+    additional LPIPS perceptual term - cfg["lpips_w"] = 0.5.)
+
+A small ResNet18 style judge is trained (or reused) once and used to score
+both DisVAE variants on:
+
+  * Reconstruction MSE (all three models).
+  * Art-style transfer accuracy + LPIPS-to-content (DisVAE variants only;
+    they are the only ones that expose a content/style swap via z_c, z_s).
 
 The legacy vae_best.pt and the StarGAN run are intentionally excluded -
 they predate the current model architecture / are out of scope here.
@@ -45,14 +54,25 @@ from utils import (  # noqa: E402
 
 
 # Display names used throughout the figures and CSV summaries.
+# `disvae_lpips` is the same DisentangledVAE architecture as `disvae`, but
+# trained with an additional LPIPS perceptual reconstruction term.
 MODEL_NAMES: dict[str, str] = {
-    "vae2":   "VAE-2 (extended)",
-    "disvae": "Disentangled VAE",
+    "vae2":         "VAE-2 (extended)",
+    "disvae":       "DisVAE (MSE)",
+    "disvae_lpips": "DisVAE + LPIPS",
 }
 MODEL_COLORS: dict[str, str] = {
-    "vae2":   "tab:cyan",
-    "disvae": "tab:green",
+    "vae2":         "tab:cyan",
+    "disvae":       "tab:green",
+    "disvae_lpips": "tab:purple",
 }
+
+# Filename of the LPIPS-trained DisVAE checkpoint (kept verbatim per the
+# upload it shipped under).
+DISVAE_LPIPS_FILE = "image-generation-genai_checkpoints_disvae_best.pt"
+
+# Keys used wherever we want to compare the two DisVAE variants side-by-side.
+DISVAE_VARIANT_KEYS: tuple[str, ...] = ("disvae", "disvae_lpips")
 
 
 # ---------------------------------------------------------------------------
@@ -185,29 +205,38 @@ def _build_disvae(ck: dict, device) -> nn.Module:
 
 
 def load_all(device) -> dict:
-    def must(name: str) -> dict:
-        ck = load_checkpoint(CHECKPOINTS_DIR / f"{name}_best.pt", map_location=device)
+    def must(path: Path, label: str) -> dict:
+        ck = load_checkpoint(path, map_location=device)
         if ck is None:
             raise FileNotFoundError(
-                f"Missing {name}_best.pt - run the corresponding training script first.")
+                f"Missing checkpoint for {label} ({path}) - run the corresponding "
+                "training script first.")
         return ck
 
-    vae2_ck = must("vae2")
-    dis_ck  = must("disvae")
+    vae2_ck      = must(CHECKPOINTS_DIR / "vae2_best.pt",   "vae2")
+    dis_ck       = must(CHECKPOINTS_DIR / "disvae_best.pt", "disvae")
+    dis_lpips_ck = must(CHECKPOINTS_DIR / DISVAE_LPIPS_FILE,
+                        "disvae_lpips (LPIPS-trained DisVAE)")
 
     vae2 = VanillaVAE(VAEConfig(**vae2_ck["cfg"])).to(device).eval()
     vae2.load_state_dict(vae2_ck["model_state"])
 
-    dis = _build_disvae(dis_ck, device)
+    dis       = _build_disvae(dis_ck,       device)
+    dis_lpips = _build_disvae(dis_lpips_ck, device)
+
+    # Sanity-check: the LPIPS-trained ckpt should actually carry an lpips_w
+    # in its cfg / a `tr_lpips` column in its history.
+    if "lpips_w" not in dis_lpips_ck.get("cfg", {}):
+        print(f"  warning: {DISVAE_LPIPS_FILE} does not advertise lpips_w in its cfg")
 
     print("Loaded models:")
-    print(f"  {MODEL_NAMES['vae2']:20s} best={vae2_ck['best_metric']:.4f} "
-          f"(epoch {vae2_ck['epoch']})")
-    print(f"  {MODEL_NAMES['disvae']:20s} best={dis_ck['best_metric']:.4f} "
-          f"(epoch {dis_ck['epoch']})")
+    for key, ck in (("vae2", vae2_ck), ("disvae", dis_ck), ("disvae_lpips", dis_lpips_ck)):
+        print(f"  {MODEL_NAMES[key]:20s} best={ck['best_metric']:.4f} "
+              f"(epoch {ck['epoch']})")
     return {
-        "vae2":   {"model": vae2, "ckpt": vae2_ck},
-        "disvae": {"model": dis,  "ckpt": dis_ck},
+        "vae2":         {"model": vae2,      "ckpt": vae2_ck},
+        "disvae":       {"model": dis,       "ckpt": dis_ck},
+        "disvae_lpips": {"model": dis_lpips, "ckpt": dis_lpips_ck},
     }
 
 
@@ -216,8 +245,42 @@ def load_all(device) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _plot_disvae_panel(ax, history_df: pd.DataFrame, title: str) -> None:
+    """Reusable per-DisVAE training panel.
+
+    Shows val recon MSE on the primary y-axis and the two disentanglement
+    classifier accuracies on a secondary axis. If the run logged an LPIPS
+    perceptual loss (`tr_lpips`), it is overlaid on a third twin axis so
+    readers can see when the perceptual term saturates.
+    """
+    ax.plot(history_df["epoch"], history_df["va_recon"],
+            label="val recon MSE", color="tab:blue")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("MSE")
+
+    ax2 = ax.twinx()
+    ax2.plot(history_df["epoch"], history_df["va_sty_acc"], color="tab:green",
+             linestyle="--", label="z_style -> style acc")
+    ax2.plot(history_df["epoch"], history_df["va_adv_acc"], color="tab:red",
+             linestyle="--", label="z_content -> style acc (adv)")
+    ax2.set_ylim(0, 1)
+    ax2.set_ylabel("classifier accuracy")
+
+    if "tr_lpips" in history_df.columns:
+        ax3 = ax.twinx()
+        ax3.spines["right"].set_position(("outward", 48))
+        ax3.plot(history_df["epoch"], history_df["tr_lpips"],
+                 color="tab:purple", linestyle=":", label="train LPIPS loss")
+        ax3.set_ylabel("LPIPS (train)", color="tab:purple")
+        ax3.tick_params(axis="y", labelcolor="tab:purple")
+
+    ax.set_title(title)
+    ax.legend(loc="upper left", fontsize=8)
+    ax2.legend(loc="upper right", fontsize=8)
+
+
 def plot_training_curves(M: dict) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.0))
+    fig, axes = plt.subplots(1, 3, figsize=(18, 4.4))
 
     v2h = pd.DataFrame(M["vae2"]["ckpt"]["history"])
     axes[0].plot(v2h["epoch"], v2h["tr_recon"], label="train")
@@ -226,17 +289,17 @@ def plot_training_curves(M: dict) -> None:
     axes[0].set_xlabel("epoch"); axes[0].set_ylabel("MSE")
     axes[0].legend()
 
-    dh = pd.DataFrame(M["disvae"]["ckpt"]["history"])
-    axes[1].plot(dh["epoch"], dh["va_recon"], label="val recon MSE", color="tab:blue")
-    ax2 = axes[1].twinx()
-    ax2.plot(dh["epoch"], dh["va_sty_acc"], color="tab:green",
-             linestyle="--", label="z_style -> style acc")
-    ax2.plot(dh["epoch"], dh["va_adv_acc"], color="tab:red",
-             linestyle="--", label="z_content -> style acc (adv)")
-    ax2.set_ylim(0, 1); ax2.set_ylabel("classifier accuracy")
-    axes[1].set_title(f"{MODEL_NAMES['disvae']} - recon + disentanglement")
-    axes[1].set_xlabel("epoch"); axes[1].set_ylabel("MSE")
-    axes[1].legend(loc="upper left"); ax2.legend(loc="upper right")
+    _plot_disvae_panel(
+        axes[1],
+        pd.DataFrame(M["disvae"]["ckpt"]["history"]),
+        f"{MODEL_NAMES['disvae']} - recon + disentanglement",
+    )
+    _plot_disvae_panel(
+        axes[2],
+        pd.DataFrame(M["disvae_lpips"]["ckpt"]["history"]),
+        f"{MODEL_NAMES['disvae_lpips']} - recon + disentanglement\n"
+        "(trained with LPIPS perceptual loss, w=0.5)",
+    )
 
     fig.suptitle("Training curves per model (lower MSE = better reconstruction)",
                  fontsize=12)
@@ -325,8 +388,18 @@ def plot_recon_bar(mses: dict[str, float]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def eval_transfer(test_ds, pair_idx, n_styles: int, dis, clf, lpips_fn,
+def eval_transfer(test_ds, pair_idx, n_styles: int,
+                  models: dict[str, nn.Module], clf, lpips_fn,
                   batch_size: int, device) -> dict:
+    """Score every model in `models` on the same set of (content, ref, tgt)
+    triples - this keeps the comparison apples-to-apples.
+
+    Returns:
+        {
+          "overall":   {model_key: {"acc_sum": int, "lp_sum": float, "n": int}},
+          "per_style": {model_key: {style_idx: {"acc": [...], "lp": [...]}}},
+        }
+    """
     rng = np.random.default_rng(0)
     test_df = pd.read_csv(DATA_PROCESSED / "splits" / "test.csv")
     style_to_idx = {lbl: test_df.index[test_df["label"] == lbl].tolist()
@@ -337,14 +410,18 @@ def eval_transfer(test_ds, pair_idx, n_styles: int, dis, clf, lpips_fn,
         x = torch.stack(xs).to(device)
         r = torch.stack(refs).to(device)
         t = torch.tensor(tgts, device=device)
-        fake_dis = dis.transfer(x, r)
-        dis_pred = clf(fake_dis).argmax(1)
-        lp_dis = lpips_fn(x, fake_dis).view(-1)
-        return t, dis_pred, lp_dis
+        out = {}
+        for k, m in models.items():
+            fake = m.transfer(x, r)
+            pred = clf(fake).argmax(1)
+            lp   = lpips_fn(x, fake).view(-1)
+            out[k] = {"pred": pred, "lp": lp}
+        return t, out
 
-    overall = {"dis_acc": 0, "dis_lp": 0.0, "n": 0}
-    per_style: dict[int, dict] = {s: {"dis_acc": [], "dis_lp": []}
-                                  for s in range(n_styles)}
+    overall   = {k: {"acc_sum": 0, "lp_sum": 0.0, "n": 0} for k in models}
+    per_style = {k: {s: {"acc": [], "lp": []} for s in range(n_styles)}
+                 for k in models}
+
     for i in tqdm(range(0, len(pair_idx), batch_size), desc="transfer"):
         batch = pair_idx[i:i + batch_size]
         xs, refs, tgts = [], [], []
@@ -354,51 +431,65 @@ def eval_transfer(test_ds, pair_idx, n_styles: int, dis, clf, lpips_fn,
             ref_idx = int(rng.choice(style_to_idx[t]))
             r, _ = test_ds[ref_idx]
             xs.append(x); refs.append(r); tgts.append(t)
-        t, dp, ld = run_batch(xs, refs, tgts)
-        for k in range(len(tgts)):
-            overall["dis_acc"] += int(dp[k] == t[k])
-            overall["dis_lp"] += ld[k].item()
-            overall["n"] += 1
-            s = tgts[k]
-            per_style[s]["dis_acc"].append(int(dp[k] == t[k]))
-            per_style[s]["dis_lp"].append(ld[k].item())
+        t, out = run_batch(xs, refs, tgts)
+        for kmodel, vals in out.items():
+            for k in range(len(tgts)):
+                hit = int(vals["pred"][k] == t[k])
+                lp  = vals["lp"][k].item()
+                overall[kmodel]["acc_sum"] += hit
+                overall[kmodel]["lp_sum"]  += lp
+                overall[kmodel]["n"]       += 1
+                s = tgts[k]
+                per_style[kmodel][s]["acc"].append(hit)
+                per_style[kmodel][s]["lp"].append(lp)
+
     return {"overall": overall, "per_style": per_style}
 
 
-def per_style_table(res: dict, styles: list[str]) -> pd.DataFrame:
+def per_style_table(res: dict, styles: list[str],
+                    model_keys: tuple[str, ...]) -> pd.DataFrame:
+    """Per-target-style metrics. Column scheme is `acc__{key}` / `lpips__{key}`
+    (double-underscore separator) so that model keys containing underscores -
+    e.g. `disvae_lpips` - cannot collide with metric suffixes.
+    """
     rows = []
     for lbl, s in enumerate(styles):
-        p = res["per_style"][lbl]
-        rows.append({
-            "style": s,
-            "DisVAE_acc":   float(np.mean(p["dis_acc"])) if p["dis_acc"] else np.nan,
-            "DisVAE_lpips": float(np.mean(p["dis_lp"]))  if p["dis_lp"]  else np.nan,
-        })
+        row: dict[str, object] = {"style": s}
+        for k in model_keys:
+            p = res["per_style"][k][lbl]
+            row[f"acc__{k}"]   = float(np.mean(p["acc"])) if p["acc"] else np.nan
+            row[f"lpips__{k}"] = float(np.mean(p["lp"]))  if p["lp"]  else np.nan
+        rows.append(row)
     df = pd.DataFrame(rows).set_index("style")
     df.to_csv(OUTPUTS_DIR / "per_style_metrics.csv")
     return df
 
 
-def plot_per_style(df: pd.DataFrame, n_styles: int) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.4))
+def plot_per_style(df: pd.DataFrame, n_styles: int,
+                   model_keys: tuple[str, ...]) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4.6))
 
-    df[["DisVAE_acc"]].plot.bar(
-        ax=axes[0], color=[MODEL_COLORS["disvae"]], legend=False)
-    axes[0].set_title(f"{MODEL_NAMES['disvae']} - "
-                      "style-transfer success per target style\n"
+    acc_cols = [f"acc__{k}" for k in model_keys]
+    df[acc_cols].rename(columns={f"acc__{k}": MODEL_NAMES[k] for k in model_keys}) \
+        .plot.bar(ax=axes[0],
+                  color=[MODEL_COLORS[k] for k in model_keys])
+    axes[0].set_title("Style-transfer success per target style\n"
                       "(higher = transferred image is classified as the target style)")
     axes[0].set_ylabel("Target-style classifier accuracy")
     axes[0].set_ylim(0, 1)
     axes[0].axhline(1 / n_styles, color="gray", linestyle="--",
                     label=f"random chance (1/{n_styles}={1/n_styles:.2f})")
-    axes[0].legend()
+    axes[0].legend(fontsize=8)
 
-    df[["DisVAE_lpips"]].plot.bar(
-        ax=axes[1], color=[MODEL_COLORS["disvae"]], legend=False)
-    axes[1].set_title(f"{MODEL_NAMES['disvae']} - "
-                      "content preservation (LPIPS to source)\n"
-                      "(lower = more original content retained)")
+    lp_cols = [f"lpips__{k}" for k in model_keys]
+    df[lp_cols].rename(columns={f"lpips__{k}": MODEL_NAMES[k] for k in model_keys}) \
+        .plot.bar(ax=axes[1],
+                  color=[MODEL_COLORS[k] for k in model_keys])
+    axes[1].set_title("Content preservation (LPIPS to source)\n"
+                      "(lower = more original content retained; "
+                      "DisVAE+LPIPS was trained against this metric)")
     axes[1].set_ylabel("LPIPS distance to content image")
+    axes[1].legend(fontsize=8)
 
     for ax in axes:
         ax.set_xlabel("Target style")
@@ -460,20 +551,25 @@ def qualitative_reconstruction(test_ds, M: dict, styles: list[str],
     x = torch.stack(xs).to(device)
 
     with torch.no_grad():
-        xr_vae2 = M["vae2"]["model"](x)["x_hat"]
-        xr_dis  = M["disvae"]["model"](x)["x_hat"]
+        xr_vae2      = M["vae2"]["model"](x)["x_hat"]
+        xr_dis       = M["disvae"]["model"](x)["x_hat"]
+        xr_dis_lpips = M["disvae_lpips"]["model"](x)["x_hat"]
 
-    rows = torch.cat([x.cpu(), xr_vae2.cpu(), xr_dis.cpu()], dim=0)
+    rows = torch.cat([x.cpu(), xr_vae2.cpu(),
+                      xr_dis.cpu(), xr_dis_lpips.cpu()], dim=0)
     col_titles = [f"#{i+1}\n({styles[ys[i]]})" for i in range(n)]
     row_labels = [
         "Input",
         MODEL_NAMES["vae2"],
         MODEL_NAMES["disvae"],
+        MODEL_NAMES["disvae_lpips"],
     ]
     fig = _row_labelled_grid(
         rows, row_labels, col_titles,
         suptitle="Reconstruction comparison - top row is the original input; "
-                 "each row below is that model's reconstruction")
+                 "each row below is that model's reconstruction "
+                 "(DisVAE+LPIPS = same arch as DisVAE, trained with an "
+                 "additional perceptual loss).")
     fig.savefig(OUTPUTS_DIR / "qualitative_reconstruction.png",
                 dpi=120, bbox_inches="tight")
     plt.close(fig)
@@ -481,7 +577,7 @@ def qualitative_reconstruction(test_ds, M: dict, styles: list[str],
 
 def qualitative_style_transfer(test_ds, M: dict, n_styles: int,
                                styles: list[str], device, n: int = 6) -> None:
-    """Per-example: content + style ref + DisVAE transfer output."""
+    """Per-example: content + style ref + each DisVAE variant's transfer output."""
     rng = np.random.default_rng(3)
     test_df = pd.read_csv(DATA_PROCESSED / "splits" / "test.csv")
     style_to_idx = {lbl: test_df.index[test_df["label"] == lbl].tolist()
@@ -498,20 +594,24 @@ def qualitative_style_transfer(test_ds, M: dict, n_styles: int,
     r = torch.stack(refs).to(device)
 
     with torch.no_grad():
-        dis_out = M["disvae"]["model"].transfer(x, r)
+        dis_out       = M["disvae"]["model"].transfer(x, r)
+        dis_lpips_out = M["disvae_lpips"]["model"].transfer(x, r)
 
-    rows = torch.cat([x.cpu(), r.cpu(), dis_out.cpu()], dim=0)
+    rows = torch.cat([x.cpu(), r.cpu(),
+                      dis_out.cpu(), dis_lpips_out.cpu()], dim=0)
     col_titles = [f"#{i+1}\n{styles[ys[i]]} -> {styles[tgts[i]]}"
                   for i in range(n)]
     row_labels = [
         "Content",
         "Style reference",
         f"{MODEL_NAMES['disvae']}\ntransfer",
+        f"{MODEL_NAMES['disvae_lpips']}\ntransfer",
     ]
     fig = _row_labelled_grid(
         rows, row_labels, col_titles,
         suptitle="Art-style transfer - column header is "
-                 "'source style -> target style'")
+                 "'source style -> target style' "
+                 "(bottom row uses the LPIPS-trained DisVAE).")
     fig.savefig(OUTPUTS_DIR / "qualitative_style_transfer.png",
                 dpi=120, bbox_inches="tight")
     plt.close(fig)
@@ -557,10 +657,9 @@ def main() -> None:
     test_loader = DataLoader(test_ds, args.batch_size, shuffle=False,
                              num_workers=args.n_loader_workers)
     mse: dict[str, float] = {
-        "vae2":   recon_mse(lambda x: M["vae2"]["model"](x)["x_hat"],
-                            test_loader, device),
-        "disvae": recon_mse(lambda x: M["disvae"]["model"](x)["x_hat"],
-                            test_loader, device),
+        k: recon_mse(lambda x, k=k: M[k]["model"](x)["x_hat"],
+                     test_loader, device)
+        for k in ("vae2", "disvae", "disvae_lpips")
     }
     print("\nTest reconstruction MSE (lower = better):")
     for k, v in mse.items():
@@ -575,30 +674,41 @@ def main() -> None:
     pair_idx = rng.choice(len(test_ds),
                           min(args.n_transfer_pairs, len(test_ds)),
                           replace=False).tolist()
+    transfer_models = {k: M[k]["model"] for k in DISVAE_VARIANT_KEYS}
     res = eval_transfer(test_ds, pair_idx, n_styles,
-                        M["disvae"]["model"],
-                        clf, lpips_fn, args.batch_size, device)
-    n = res["overall"]["n"]
-    print(f"\nStyle-transfer evaluation ({n} pairs):")
-    print(f"  {MODEL_NAMES['disvae']:20s} target-style acc={res['overall']['dis_acc']/n:.3f}"
-          f"   LPIPS={res['overall']['dis_lp']/n:.3f}")
+                        transfer_models, clf, lpips_fn,
+                        args.batch_size, device)
+    print("\nStyle-transfer evaluation:")
+    for k in DISVAE_VARIANT_KEYS:
+        ov = res["overall"][k]
+        n = ov["n"]
+        print(f"  {MODEL_NAMES[k]:20s} pairs={n}  "
+              f"target-style acc={ov['acc_sum']/n:.3f}   "
+              f"LPIPS={ov['lp_sum']/n:.3f}")
 
-    ps_df = per_style_table(res, styles)
-    plot_per_style(ps_df, n_styles)
+    ps_df = per_style_table(res, styles, DISVAE_VARIANT_KEYS)
+    plot_per_style(ps_df, n_styles, DISVAE_VARIANT_KEYS)
     qualitative_reconstruction(test_ds, M, styles, device)
     qualitative_style_transfer(test_ds, M, n_styles, styles, device)
 
+    def _acc(k: str) -> float:
+        ov = res["overall"][k]
+        return ov["acc_sum"] / ov["n"] if ov["n"] else float("nan")
+
+    def _lp(k: str) -> float:
+        ov = res["overall"][k]
+        return ov["lp_sum"] / ov["n"] if ov["n"] else float("nan")
+
     summary = pd.DataFrame({
-        "Model": [MODEL_NAMES["vae2"], MODEL_NAMES["disvae"]],
+        "Model": [MODEL_NAMES[k] for k in ("vae2", "disvae", "disvae_lpips")],
         "Test recon MSE (lower=better)": [
-            mse["vae2"], mse["disvae"]],
+            mse["vae2"], mse["disvae"], mse["disvae_lpips"],
+        ],
         "Style-transfer acc (higher=better)": [
-            float("nan"),
-            res["overall"]["dis_acc"] / n,
+            float("nan"), _acc("disvae"), _acc("disvae_lpips"),
         ],
         "Content LPIPS (lower=better)": [
-            float("nan"),
-            res["overall"]["dis_lp"] / n,
+            float("nan"), _lp("disvae"), _lp("disvae_lpips"),
         ],
     }).set_index("Model").round(4)
     summary.to_csv(OUTPUTS_DIR / "summary.csv")
