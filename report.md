@@ -193,9 +193,6 @@ These results do not support claims beyond the above because:
 
 ## 6. Future work
 
-A roadmap, not a backlog. Three workstreams, in the order they should
-be tackled - each one unlocks the next.
-
 ### A. Sharpen reconstructions (fix the blur)
 
 The dominant qualitative failure mode of both VAEs is low-frequency
@@ -222,15 +219,10 @@ accuracies. The latents need to be both *measured* better and
    gentle - results in a `z_s` that holds only loose style
    information. Re-tune with wider hyperparameter ranges so the two
    latents actually specialize.
-4. **Look inside the latents.** Add a latent-space probe (a 2D
+4. **Look inside the latent space.** Add a latent-space probe (a 2D
    projection of `z_c` and `z_s` colored by ground-truth style, plus
    a few traversal grids). Either confirms the disentanglement story
    or shows where it breaks.
-5. **Put both DisVAE variants on the same backbone.** The MSE-only
-   DisVAE still uses the legacy architecture; retraining it on the
-   current one removes the architectural confound from the
-   LPIPS-vs-MSE comparison and lets the legacy compatibility shim
-   in `04` be deleted.
 
 ### C. Better style transfer
 
@@ -251,5 +243,7 @@ Closing that gap is the single biggest accuracy lever left.
 
 ## 7. Difficulties faced
 
-1. Hardware Constraints: Training the model locally took a long time as I use a Macbook Air. Training it on collab multiple times caused my compute to run out. Jobs on the HPC stalled with no error logs, which meant a lot of wasted time. 
-2. Designing the architectures: Simple models performed very poorly. 2-3 iterations of architectures and models showed little to no performance improvements. Combined with the hardware constraints, there was little to no improvement in this regard.
+1. **Hardware and runtime constraints.** End-to-end training was slow on a local MacBook Air, while repeated Colab runs frequently exhausted compute limits before experiments could finish. HPC jobs also stalled intermittently without actionable error logs, which introduced debugging overhead and reduced iteration speed.
+2. **Architecture iteration under tight budgets.** Early/simple baselines performed poorly, but testing stronger alternatives required multi-run sweeps that were expensive in both time and compute. Several architecture iterations yielded only marginal gains, making it difficult to separate promising ideas from noise.
+3. **Optimization instability in style-transfer objectives.** Adversarial and disentanglement losses were sensitive to weighting and scheduling. Small hyperparameter changes often shifted behavior from weak style learning to unstable training, especially for GAN experiments where mode collapse appeared early.
+4. **Class imbalance in the selected WikiArt subset.** The ~11x skew across styles made it harder to learn minority-style signals and likely contributed to uneven per-style transfer quality. This also complicated fair comparison across target styles.
